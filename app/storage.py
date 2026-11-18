@@ -4,6 +4,13 @@
 - 每个 trip 有单调递增 revision；确认提交采用条件更新
   UPDATE trip SET revision=? WHERE id=? AND revision=?，配合 BEGIN IMMEDIATE
   写事务，同一 revision 的并发确认只有一个事务能成功（其余提交 0 行 -> 409）。
+- 草稿（预览）带一次性令牌 draft_id：每次保存草稿都生成新令牌，预览页表单
+  携带该令牌，确认在事务内核对——令牌不匹配说明页面已被新修订替换，
+  确认被拒绝，正式版保持原状。确认只能发布该页面所见的数据。
+- 草稿的两份 CSV 原文、读数/装卸与计算结果在单个事务内写入同一行，
+  不会留下"结果与原文分属不同修订"的混合草稿；确认提交在单事务内
+  整趟替换正式数据，并按令牌条件删除草稿——确认与修订交错时，
+  已保存成功的新草稿不会被旧确认误删。
 - 每次确认在单个事务内整趟替换：删除旧 readings/rides/results 后重插，
   任何一步失败全部回滚；查询永远只能看到完整旧版或完整新版。
 - WAL 模式 + busy_timeout，兼顾读写并发与重启后的持久化。
@@ -12,6 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,6 +29,8 @@ CREATE TABLE IF NOT EXISTS trip (
     name            TEXT NOT NULL,
     revision        INTEGER NOT NULL,
     temp_limit      REAL NOT NULL,
+    temp_csv        TEXT NOT NULL DEFAULT '',
+    handling_csv    TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     confirmed_at    TEXT
 );
@@ -52,19 +62,27 @@ CREATE TABLE IF NOT EXISTS trip_result (
 CREATE INDEX IF NOT EXISTS idx_ride_trip ON trip_ride(trip_id, revision);
 CREATE INDEX IF NOT EXISTS idx_result_trip ON trip_result(trip_id, revision);
 CREATE TABLE IF NOT EXISTS trip_draft (
-    trip_id TEXT PRIMARY KEY, expected_revision INTEGER NOT NULL,
-    name TEXT NOT NULL, temp_limit REAL NOT NULL,
-    readings TEXT NOT NULL, rides TEXT NOT NULL, results TEXT NOT NULL,
+    trip_id TEXT PRIMARY KEY,
+    draft_id TEXT NOT NULL,
+    expected_revision INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    temp_limit REAL NOT NULL,
+    temp_csv TEXT NOT NULL,
+    handling_csv TEXT NOT NULL,
+    readings TEXT NOT NULL,
+    rides TEXT NOT NULL,
+    results TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-);
-CREATE TABLE IF NOT EXISTS trip_draft_source (
-    trip_id TEXT PRIMARY KEY, temp_csv TEXT NOT NULL, handling_csv TEXT NOT NULL
 );
 """
 
 
 class RevisionConflict(RuntimeError):
-    """同一 revision 的确认已被其他事务抢先提交。"""
+    """同一 revision 的确认已被其他事务抢先提交，或修订基线已过期。"""
+
+
+class DraftConflict(RuntimeError):
+    """确认所针对的草稿已被新的修订替换（预览页过期）。"""
 
 
 class NotFound(LookupError):
@@ -90,9 +108,35 @@ def _connect(db_path: str | Path) -> sqlite3.Connection:
 
 
 def init_db(db_path: str | Path) -> None:
+    """建表 + 结构迁移，整体在单个 IMMEDIATE 事务内完成（多 worker 启动时串行）。
+
+    旧版把草稿拆成 trip_draft / trip_draft_source 两表分两事务写入，
+    失败或重启后可能留下"结果与 CSV 原文分属不同修订"的混合草稿。
+    草稿属于临时数据，结构升级时直接重建；正式版本数据不动。
+    """
     conn = _connect(db_path)
     try:
-        conn.executescript(SCHEMA)
+        conn.execute("BEGIN IMMEDIATE")
+        draft_cols = {r[1] for r in conn.execute("PRAGMA table_info(trip_draft)")}
+        if draft_cols and "draft_id" not in draft_cols:
+            conn.execute("DROP TABLE trip_draft")
+        # 旧旁路表已并入 trip_draft，一律清除，杜绝混合草稿残留
+        conn.execute("DROP TABLE IF EXISTS trip_draft_source")
+        for statement in SCHEMA.split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        trip_cols = {r[1] for r in conn.execute("PRAGMA table_info(trip)")}
+        if "temp_csv" not in trip_cols:
+            conn.execute(
+                "ALTER TABLE trip ADD COLUMN temp_csv TEXT NOT NULL DEFAULT ''"
+            )
+            conn.execute(
+                "ALTER TABLE trip ADD COLUMN handling_csv TEXT NOT NULL DEFAULT ''"
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -124,29 +168,46 @@ def upsert_draft(
     expected_revision: int,
     name: str,
     temp_limit: float,
+    temp_csv: str,
+    handling_csv: str,
     readings: list[tuple[int, float]],
     rides: list[tuple[str, int, int]],
     results: dict[str, dict],
-) -> None:
-    """保存草稿（同一 trip 反复修正只保留最新一份）。
+) -> str:
+    """保存草稿（同一 trip 反复修正只保留最新一份），返回草稿令牌 draft_id。
 
-    草稿带 expected_revision：确认时若 trip.revision 已前进则拒绝。
+    两份 CSV 原文、读数/装卸与计算结果在单个事务内写入同一行，
+    始终属于同一次修订；失败或重启不会留下混合草稿。
+    事务内校验基线修订号：若正式版已被并发确认推进，则拒绝写入，
+    避免"提示成功却永远确认不了"的过期草稿。
     """
+    draft_id = uuid.uuid4().hex
     with db_cursor(commit=True) as conn:
+        row = conn.execute("SELECT revision FROM trip WHERE id=?", (trip_id,)).fetchone()
+        current = row["revision"] if row else 0
+        if current != expected_revision:
+            raise RevisionConflict(
+                f"正式版本已推进到 rev {current}，基于 rev {expected_revision} "
+                "的修订已过期，请基于最新版本重新修正"
+            )
         conn.execute(
-            "INSERT INTO trip_draft(trip_id, expected_revision, name, temp_limit, "
-            "readings, rides, results) VALUES(?,?,?,?,?,?,?) "
-            "ON CONFLICT(trip_id) DO UPDATE SET expected_revision=excluded.expected_revision, "
-            "name=excluded.name, temp_limit=excluded.temp_limit, readings=excluded.readings, "
-            "rides=excluded.rides, results=excluded.results, "
+            "INSERT INTO trip_draft(trip_id, draft_id, expected_revision, name, temp_limit, "
+            "temp_csv, handling_csv, readings, rides, results) VALUES(?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(trip_id) DO UPDATE SET draft_id=excluded.draft_id, "
+            "expected_revision=excluded.expected_revision, "
+            "name=excluded.name, temp_limit=excluded.temp_limit, "
+            "temp_csv=excluded.temp_csv, handling_csv=excluded.handling_csv, "
+            "readings=excluded.readings, rides=excluded.rides, results=excluded.results, "
             "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
             (
-                trip_id, expected_revision, name, temp_limit,
+                trip_id, draft_id, expected_revision, name, temp_limit,
+                temp_csv, handling_csv,
                 json.dumps(readings, separators=(",", ":")),
                 json.dumps(rides, separators=(",", ":")),
                 json.dumps(results, separators=(",", ":")),
             ),
         )
+    return draft_id
 
 
 def get_draft(trip_id: str) -> dict | None:
@@ -158,17 +219,16 @@ def get_draft(trip_id: str) -> dict | None:
         return None
     return {
         "trip_id": row["trip_id"],
+        "draft_id": row["draft_id"],
         "expected_revision": row["expected_revision"],
         "name": row["name"],
         "temp_limit": row["temp_limit"],
+        "temp_csv": row["temp_csv"],
+        "handling_csv": row["handling_csv"],
         "readings": json.loads(row["readings"]),
         "rides": json.loads(row["rides"]),
         "results": json.loads(row["results"]),
     }
-
-
-def delete_draft(conn: sqlite3.Connection, trip_id: str) -> None:
-    conn.execute("DELETE FROM trip_draft WHERE trip_id=?", (trip_id,))
 
 
 # ---------- 正式版本（已确认结论，只增不改） ----------
@@ -181,12 +241,30 @@ def commit_revision(
     readings: list[tuple[int, float]],
     rides: list[tuple[str, int, int]],
     results: dict[str, dict],
+    *,
+    temp_csv: str = "",
+    handling_csv: str = "",
+    draft_token: str | None = None,
 ) -> int:
-    """整趟替换提交。返回新 revision；expected_revision 过期则抛 RevisionConflict。
+    """整趟替换提交。返回新 revision。
 
+    - expected_revision 过期（正式版已被推进）则抛 RevisionConflict；
+    - 传入 draft_token 时，事务内核对当前草稿令牌：令牌不匹配说明预览页
+      已被新修订替换（或草稿已被确认），抛 DraftConflict，正式版保持原状；
+    - 草稿删除与确认同事务，且按令牌条件删除：交错期间保存成功的新草稿
+      不会被这次旧确认误删。
     新 trip（expected_revision=0 且不存在）创建为 revision 1。
     """
     with db_cursor(commit=True) as conn:
+        if draft_token is not None:
+            row = conn.execute(
+                "SELECT draft_id FROM trip_draft WHERE trip_id=?", (trip_id,)
+            ).fetchone()
+            if row is None:
+                raise DraftConflict("待确认的预览已不存在（可能已被确认或替换）")
+            if row["draft_id"] != draft_token:
+                raise DraftConflict("预览已被新的修订替换，本次确认作废")
+
         trip = conn.execute("SELECT revision FROM trip WHERE id=?", (trip_id,)).fetchone()
         current = trip["revision"] if trip else 0
         if current != expected_revision:
@@ -197,16 +275,16 @@ def commit_revision(
 
         if trip is None:
             conn.execute(
-                "INSERT INTO trip(id, name, revision, temp_limit, confirmed_at) "
-                "VALUES(?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
-                (trip_id, name, new_revision, temp_limit),
+                "INSERT INTO trip(id, name, revision, temp_limit, temp_csv, handling_csv, "
+                "confirmed_at) VALUES(?,?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+                (trip_id, name, new_revision, temp_limit, temp_csv, handling_csv),
             )
         else:
             updated = conn.execute(
-                "UPDATE trip SET revision=?, name=?, temp_limit=?, "
+                "UPDATE trip SET revision=?, name=?, temp_limit=?, temp_csv=?, handling_csv=?, "
                 "confirmed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
                 "WHERE id=? AND revision=?",
-                (new_revision, name, temp_limit, trip_id, current),
+                (new_revision, name, temp_limit, temp_csv, handling_csv, trip_id, current),
             ).rowcount
             if updated != 1:  # 并发下另一事务已推进 revision
                 raise RevisionConflict("同一修订号的并发确认只允许一次")
@@ -237,7 +315,14 @@ def commit_revision(
                 for box, r in results.items()
             ],
         )
-        delete_draft(conn, trip_id)
+        if draft_token is not None:
+            # 只删除本次确认的这份草稿；期间出现的更新草稿（令牌不同）保留
+            conn.execute(
+                "DELETE FROM trip_draft WHERE trip_id=? AND draft_id=?",
+                (trip_id, draft_token),
+            )
+        else:
+            conn.execute("DELETE FROM trip_draft WHERE trip_id=?", (trip_id,))
         return new_revision
 
 
@@ -264,6 +349,8 @@ def get_trip(trip_id: str) -> dict:
         "name": trip["name"],
         "revision": revision,
         "temp_limit": trip["temp_limit"],
+        "temp_csv": trip["temp_csv"],
+        "handling_csv": trip["handling_csv"],
         "created_at": trip["created_at"],
         "confirmed_at": trip["confirmed_at"],
         "readings": [(r["ts"], r["celsius"]) for r in readings],

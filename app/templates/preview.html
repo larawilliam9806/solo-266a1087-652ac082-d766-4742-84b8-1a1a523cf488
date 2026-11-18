@@ -74,6 +74,7 @@
   </form>
 
   <form method="post" action="{{ url_for('confirm', trip_id=draft.trip_id) }}" style="margin-top:8px">
+    <input type="hidden" name="draft_id" value="{{ draft.draft_id }}">
     <button type="submit" {% if stale %}disabled title="预览已过期，请重新修正"{% endif %}>
       确认并整趟替换正式结论
     </button>
@@ -82,7 +83,7 @@
     {% else %}
       <a class="btn secondary" href="{{ url_for('index') }}">放弃预览</a>
     {% endif %}
-    <p class="muted" style="margin-top:8px">确认在单个数据库事务内完成：同修订号并发确认只有一次成功；查询只见完整旧版或完整新版。</p>
+    <p class="muted" style="margin-top:8px">确认只发布本页所示的温度上限、装卸数据与逐箱结论；若此后出现新修订，本页确认将被拒绝且正式版保持原状。确认在单个数据库事务内完成：同修订号并发确认只有一次成功；查询只见完整旧版或完整新版。</p>
   </form>
 </div>
 {% endblock %}
